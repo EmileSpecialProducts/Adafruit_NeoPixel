@@ -16,10 +16,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #if defined(ESP32)
-
 #include <Arduino.h>
+#endif 
+
+#if defined(CONFIG_IDF_TARGET_ESP32C2) || defined(CONFIG_IDF_TARGET_ESP32C61)
+#ifndef ADAFRUIT_SPI
+#define ADAFRUIT_SPI  
+#endif
+#endif
+
+#if defined(ESP32) && !defined(ADAFRUIT_SPI) 
 
 #if defined(ESP_IDF_VERSION)
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
@@ -29,7 +36,6 @@
 #define HAS_ESP_IDF_5
 #endif
 #endif
-
 
 #ifdef HAS_ESP_IDF_5
 
