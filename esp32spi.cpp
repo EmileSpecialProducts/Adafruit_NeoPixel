@@ -179,9 +179,9 @@ uint8_t* buf;
 /*!
   @brief Encode a single LED color byte to SPI bits (WS2811)
   @param data LED color byte (0-255)
-  @param buf Output buffer (must be zeroed, 3 bytes)
+  @param buf Output buffer (must be zeroed, 10 bytes / LED byte)
   @return Length in bits
-  @note  WS2811 timing via SPI at 4.0MHz (250ns per bit):
+  @note  WS2811 timing via SPI at 4.0MHz (250ns per SPI bit):
     Each LED bit needs 10 SPI bits.
     LED '0' → 1100000000 (2×250ns high + 8×250ns low = 500ns + 2000ns)
     LED '1' → 1111100000 (5×250ns high + 5×250ns low = 1250ns + 1250ns)
@@ -193,81 +193,111 @@ uint32_t encodeLeds400hz(uint8_t *pixels, uint32_t numBytes, uint8_t *SpiBuffer)
     for (uint32_t i = 0; i < numBytes; i++) {
       for (uint32_t bit = 0x80; bit; bit >>= 1) {
         if (pixels[i] & bit) {
-          Highbits =2;
-          Lowbits =8;
-        }
-        else {
           Highbits =5;
           Lowbits =5;
         }
+        else {
+          Highbits =2;
+          Lowbits =8;
+        }
         for(uint8_t h=0;h<Highbits;h++) {
-          SpiBuffer[Bitpos / 8] |= (1 << (7 - (Bitpos % 8)));
+          //SpiBuffer[Bitpos / 8] |= (1 << (7 - (Bitpos % 8)));
+          SpiBuffer[Bitpos / 8] |= (0x80 >> (Bitpos & 7));
           Bitpos++;
         }
-        Bitpos+=Lowbits;       // Buffer is zero-initialized, so we only need to set high bits
+        Bitpos+=Lowbits;       // Buffer is zero-initialized, so we only need to set the high bits
     }
   }
   return Bitpos;
 }
 
-/*!
-  @brief   This will release all the recourses that are used in the espShow_init() function..
-  @param   uint8_t pin 
-  @param   uint8_t *pixels
-  @param   uint32_t numBytes id the number of led * 3
-  @param   boolean is800KHz
-  @note    espShow sends pixel data to an LED strip using SPI on the specified pin, 
-           encoding each byte and managing the SPI transaction with synchronization via a semaphore. 
-           It supports both 800KHz and other timing modes, and handles errors during SPI queueing and transaction completion.
-*/
-extern "C" void espShow( uint8_t pin, uint8_t *pixels, uint32_t numBytes, bool is800KHz) {
  spi_host_device_t mSpiHost;
- spi_device_handle_t mSpiDevice;
+spi_device_handle_t mSpiDevice=NULL;
  spi_transaction_t mTransaction;   // SPI transaction descriptor
  spi_bus_config_t bus_config = {};
  spi_device_interface_config_t dev_config = {};
  uint8_t *SpiBuffer=NULL;
  int SpiBufferlen=0;  
+uint8_t pinUsed=-1;
 
-  if(numBytes>0)
+/**
+ * @brief Deinitialize SPI resources allocated by espShowInit.
+ *
+ * Frees the SPI device and bus, releases the SPI host, frees the temporary
+ * SPI buffer, and resets internal tracking variables.
+ */
+void espShowDestruct()
   {
-    if (show_mutex && xSemaphoreTake(show_mutex, SEMAPHORE_TIMEOUT_MS / portTICK_PERIOD_MS) == pdTRUE) {  
-        int32_t bufferzise = numBytes * 3; // size for 800KHz 
-        if(!is800KHz) bufferzise = numBytes * 10; // size for 400KHz
-        //log_e("espShow pin = %d,numBytes = %d,is800KHz = %d",pin,numBytes,is800KHz);
-        // Allocate SPI buffer (3x LED data for WS2812 encoding) (10x LED data for WS2811 encoding)   
-        SpiBuffer = (uint8_t *)malloc(bufferzise); // 3 bytes per byte
-        if(SpiBuffer == NULL) {
-            SpiBufferlen = 0;
-            log_e("espShow malloc failed ");
-            xSemaphoreGive(show_mutex);
-            return ;
+  //log_e("espShowDestruct");
+  pinUsed = -1;// Reset pin tracking
+
+  if (mSpiDevice) {
+    spi_bus_remove_device(mSpiDevice);
+    mSpiDevice = NULL;
+    spi_bus_free(mSpiHost);
+    releaseSpiHost(mSpiHost);
   }
-    SpiBufferlen=bufferzise;      // Each LED byte → 3 SPI bytes
+
+  if (SpiBuffer) {
+    free(SpiBuffer);
+    SpiBuffer = NULL;
+  }
+
+            SpiBufferlen = 0;
+  }
+
+/**
+ * @brief Initialize SPI resources for SPI NeoPixel output on a given pin.
+ *
+ * Allocates internal SPI buffer and configures the SPI bus/device for
+ * either 800 kHz (WS2812) or 400 kHz (WS2811) timing. If an existing buffer
+ * or configuration for a different pin/size exists, it will be deinitialized
+ * first by calling `espShowDestruct()`.
+ *
+ * @param pin GPIO pin number used as MOSI for SPI output.
+ * @param numBytes Number of data bytes (typically number of LEDs * 3).
+ * @param is800KHz true to configure for WS2812 (800 kHz timing), false for
+ *                 WS2811 (400 kHz timing).
+ *
+ * @note This function selects an available SPI host with
+ *       `getNextAvailableSpiHost()` and initializes the bus using
+ *       `spi_bus_initialize(..., SPI_DMA_CH_AUTO)`. On failure it logs an
+ *       error and calls `ESP_ERROR_CHECK()` which may abort.
+ */
+void espShowInit(uint8_t pin, uint32_t numBytes, bool is800KHz)
+{
+  uint32_t Memoryneded = numBytes * 3; // size for 800KHz // WS2812 
+  if(!is800KHz) Memoryneded = numBytes * 10; // size for 400KHz // WS2811
+  
+  if(pinUsed!=pin || SpiBufferlen!=Memoryneded) espShowDestruct();
+  if(pinUsed!=pin || SpiBufferlen!=Memoryneded)
+  {
+    // Allocate SPI buffer (3x LED data for WS2812 encoding) (10x LED data for WS2811 encoding)      
+    //log_e("espShowInit pin = %d,numBytes = %d,is800KHz = %d",pin,numBytes,is800KHz);
+    
         mSpiHost = getNextAvailableSpiHost();
         if(mSpiHost == SPI_HOST_MAX) {
             log_e("espShow No available SPI host");
-            free(SpiBuffer);
-            SpiBuffer = NULL;
-      SpiBufferlen=0;
-            xSemaphoreGive(show_mutex);
             return ;
     }
+
         // Initialize SPI bus
         bus_config.mosi_io_num = pin;
         bus_config.miso_io_num = -1;  // Not used
         bus_config.sclk_io_num = -1;  // Not used (data-only SPI)
         bus_config.quadwp_io_num = -1;
         bus_config.quadhd_io_num = -1;
-        bus_config.max_transfer_sz = SpiBufferlen;
-        bus_config.data_io_default_level=0; ///< Output data IO default level when no transaction.
+    bus_config.max_transfer_sz = 0; // SpiBufferlen // Maximum transfer size, in bytes. Defaults to 4092 if 0 when DMA enabled
+    bus_config.data_io_default_level=LOW; ///< Output data IO default level when no transaction.
         bus_config.flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS;
+    // the spi_bus_initialize will create a 6 us high pulse on MOSI line at the start of the transaction
+    // which can cause issues with some led strips.
         esp_err_t ret = spi_bus_initialize(mSpiHost, &bus_config, SPI_DMA_CH_AUTO);
         if (ret != ESP_OK) {
-            log_e("SPI bus initialize failed: \n"); //<< esp_err_to_name(ret));
+      log_e("SPI bus initialize failed:\n");
             ESP_ERROR_CHECK(ret);
         }
-        // Configure SPI device
+
         dev_config.address_bits = 0;
         dev_config.command_bits = 0;
         dev_config.dummy_bits=0;
@@ -285,6 +315,35 @@ extern "C" void espShow( uint8_t pin, uint8_t *pixels, uint32_t numBytes, bool i
             spi_bus_free(mSpiHost);
             ESP_ERROR_CHECK(ret);
         }
+
+    pinUsed = pin;
+    SpiBufferlen = Memoryneded;
+  }
+}
+
+/*!
+  @brief   This will release all the recourses that are used in the espShow_init() function..
+  @param   uint8_t pin 
+  @param   uint8_t *pixels
+  @param   uint32_t numBytes id the number of led * 3
+  @param   boolean is800KHz
+  @note    espShow sends pixel data to an LED strip using SPI on the specified pin, 
+           encoding each byte and managing the SPI transaction with synchronization via a semaphore. 
+           It supports both 800KHz and other timing modes, and handles errors during SPI queueing and transaction completion.
+*/
+extern "C" void espShow( uint8_t pin, uint8_t *pixels, uint32_t numBytes, bool is800KHz) {
+  
+  if(numBytes>0)
+  {
+    espShowInit( pin,numBytes,is800KHz);         
+    for(int attempt=0;attempt<1;attempt++) {
+      SpiBuffer = (uint8_t *)malloc(SpiBufferlen); // 3 or 10 bytes per LED byte
+      if(SpiBuffer == NULL) {
+        SpiBufferlen = 0;
+        log_e("espShow malloc failed ");
+      }
+      else
+      {
         // Prepare SPI transaction
         memset(&mTransaction, 0, sizeof(mTransaction));
         // Encode LED buffer to SPI buffer and return the length in bits
@@ -294,9 +353,11 @@ extern "C" void espShow( uint8_t pin, uint8_t *pixels, uint32_t numBytes, bool i
     } else {
             mTransaction.length = encodeLeds400hz(pixels, numBytes, SpiBuffer);
     }
+        if (show_mutex && xSemaphoreTake(show_mutex, SEMAPHORE_TIMEOUT_MS / portTICK_PERIOD_MS) == pdTRUE) {
     mTransaction.tx_buffer = SpiBuffer;
     mTransaction.rx_buffer = NULL;
-            ret = spi_device_acquire_bus(mSpiDevice, portMAX_DELAY);
+        // Configure SPI device
+        esp_err_t ret = spi_device_acquire_bus(mSpiDevice, portMAX_DELAY);
     if (ret != ESP_OK) {
                 log_e("SPI transaction acquire bus failed: %d", ret);// << esp_err_to_name(ret));
         ESP_ERROR_CHECK(ret);
@@ -307,20 +368,16 @@ extern "C" void espShow( uint8_t pin, uint8_t *pixels, uint32_t numBytes, bool i
         ESP_ERROR_CHECK(ret);
     }
             spi_device_release_bus(mSpiDevice);
-        if (mSpiDevice) {
-            spi_bus_remove_device(mSpiDevice);
-            mSpiDevice = NULL;
-            spi_bus_free(mSpiHost);
-            releaseSpiHost(mSpiHost);
+        xSemaphoreGive(show_mutex);
+        }  else {
+          log_e("espShow could not obtain mutex");
         }
-        if(SpiBuffer) {
+        if (SpiBuffer) 
+        {
             free(SpiBuffer);
             SpiBuffer = NULL;
         }
-        SpiBufferlen = 0;
-    xSemaphoreGive(show_mutex);
-    }  else {
-        log_e("espShow could not obtain mutex");
+      }
   }
   } // espShow numBytes is zero"
 }
